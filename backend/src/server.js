@@ -1,4 +1,6 @@
 const express = require('express');
+const { google } = require('googleapis');
+const { Readable } = require('stream');
 const multer = require('multer');
 const cors = require('cors');
 const { parse } = require('csv-parse/sync');
@@ -529,9 +531,12 @@ Important: Reference specific numbers from this data. Do not be generic. Output 
       }
     }
 
-    // Fire HubSpot submission in background
+    // Fire HubSpot and Drive in background
     submitToHubSpot({ accountName, name, email, phone, auditScore: auditData.accountScore })
       .catch(err => console.error('HubSpot error:', err.message));
+
+    saveToDrive({ accountName, name, email, files: req.files, auditData })
+      .catch(err => console.error('Drive error:', err.message));
 
     res.json({ success: true, audit: auditData, accountName });
 
@@ -584,6 +589,89 @@ async function submitToHubSpot({ accountName, name, email, phone, auditScore }) 
         );
       }
     } else throw err;
+  }
+}
+
+
+// ─── Google Drive ─────────────────────────────────────────────────────────────
+
+function getDriveClient() {
+  if (!process.env.GOOGLE_SERVICE_ACCOUNT_JSON) return null;
+  try {
+    const creds = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+    const auth = new google.auth.GoogleAuth({
+      credentials: creds,
+      scopes: ['https://www.googleapis.com/auth/drive']
+    });
+    return google.drive({ version: 'v3', auth });
+  } catch (e) {
+    console.error('Drive auth error:', e.message);
+    return null;
+  }
+}
+
+async function createDriveFolder(drive, name, parentId) {
+  const res = await drive.files.create({
+    requestBody: {
+      name,
+      mimeType: 'application/vnd.google-apps.folder',
+      parents: [parentId]
+    },
+    fields: 'id'
+  });
+  return res.data.id;
+}
+
+async function uploadFileToDrive(drive, folderId, filename, buffer, mimeType) {
+  const stream = Readable.from(buffer);
+  await drive.files.create({
+    requestBody: {
+      name: filename,
+      parents: [folderId]
+    },
+    media: {
+      mimeType: mimeType || 'application/octet-stream',
+      body: stream
+    }
+  });
+}
+
+async function saveToDrive({ accountName, name, email, files, auditData }) {
+  const drive = getDriveClient();
+  const parentFolderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
+  if (!drive || !parentFolderId) return;
+
+  try {
+    const date = new Date().toISOString().slice(0, 10);
+    const folderName = `${accountName} — ${date}`;
+    const folderId = await createDriveFolder(drive, folderName, parentFolderId);
+
+    // Upload raw report files
+    for (const file of files) {
+      const ext = file.originalname.split('.').pop().toLowerCase();
+      const mime = ext === 'csv' ? 'text/csv'
+        : ext === 'xlsx' ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        : 'application/octet-stream';
+      await uploadFileToDrive(drive, folderId, file.originalname, file.buffer, mime);
+    }
+
+    // Upload audit JSON summary
+    const summary = {
+      submittedAt: new Date().toISOString(),
+      accountName,
+      contactName: name,
+      contactEmail: email,
+      accountScore: auditData.accountScore,
+      totalOpportunity: auditData.totalProjectedOpportunity,
+      headline: auditData.headline,
+      audit: auditData
+    };
+    const summaryBuffer = Buffer.from(JSON.stringify(summary, null, 2));
+    await uploadFileToDrive(drive, folderId, 'audit-summary.json', summaryBuffer, 'application/json');
+
+    console.log(`Drive: saved ${files.length} files + summary to "${folderName}"`);
+  } catch (e) {
+    console.error('Drive upload error:', e.message);
   }
 }
 
