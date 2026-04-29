@@ -55,7 +55,14 @@ function parseCSV(buffer, originalname) {
     try {
       const workbook = XLSX.read(buffer, { type: 'buffer', cellDates: true });
       const sheet = workbook.Sheets[workbook.SheetNames[0]];
-      const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+      let rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+      // If first row looks like SQP metadata (key contains '='), skip it and re-parse
+      if (rows.length > 0) {
+        const firstKey = Object.keys(rows[0])[0] || '';
+        if (firstKey.includes('=') || firstKey.includes('[')) {
+          rows = XLSX.utils.sheet_to_json(sheet, { defval: '', range: 1 });
+        }
+      }
       return rows;
     } catch (e) {
       console.error('XLSX parse error:', e.message);
@@ -91,16 +98,20 @@ function detectReportType(headers) {
   const has = (...keys) => keys.every(k => h.has(k));
   const any = (...keys) => keys.some(k => h.has(k));
 
-  if (any('real-time status', 'estimated missed sales due to budget', 'estimated missed clicks due to budget')) return 'budget';
+  if (any('real-time status', 'estimated missed sales due to budget', 'estimated missed clicks due to budget', 'avg. time in budget', 'estimated missed sales min', 'estimated missed sales min(eur)', 'estimated missed clicks min')) return 'budget';
   if (h.has('placement') && any('campaign name', 'spend')) return 'placement';
   if (h.has('sessions') || h.has('unit session percentage')) return 'business_report';
-  if (h.has('search query') && any('impressions - brand share', 'purchases - brand share', 'brand share')) return 'brand_analytics';
+  if (h.has('search query') && any('impressions: brand share %', 'impressions - brand share', 'purchases - brand share', 'brand share', 'clicks: brand share %')) return 'brand_analytics';
   if (any('repeat purchase orders', 'repeat purchase rate', 'new-to-brand orders')) return 'repeat_purchase';
-  if (h.has('customer search term') && h.has('campaign name')) {
-    const campaignTypeCol = [...h].find(x => x.includes('campaign type') || x.includes('ad type'));
-    return 'sp_search_term'; // default; SB won't usually have 'customer search term'
-  }
-  if (h.has('targeting expression') || any('keyword bid', 'match type')) return 'targeting';
+
+  // SB: customer search term + 14-day attribution + cost type column
+  if (h.has('customer search term') && any('14 day total sales', '14-day total sales') && h.has('cost type')) return 'sb_search_term';
+  // SD: no customer search term + 14-day attribution + bid optimisation
+  if (!h.has('customer search term') && any('14 day total sales', '14-day total sales') && any('bid optimisation', 'bid optimization', 'viewable impressions')) return 'sd_targeting';
+  // SP search term
+  if (h.has('customer search term') && h.has('campaign name')) return 'sp_search_term';
+  // SP targeting
+  if (h.has('match type') && h.has('targeting') && h.has('campaign name')) return 'targeting';
   return 'unknown';
 }
 
@@ -178,17 +189,36 @@ function aggregateBudget(rows) {
 
   for (const row of rows) {
     totalCampaigns++;
-    const status = (row['Real-time Status'] || row['Budget Status'] || '').toLowerCase();
-    const missedSales = num(row['Estimated Missed Sales due to Budget'] || row['Estimated missed sales due to budget'] || 0);
-    const missedClicks = num(row['Estimated Missed Clicks due to Budget'] || 0);
-    const campaignName = row['Campaign Name'] || row['Campaign name'] || '';
-    const dailyBudget = num(row['Campaign Daily Budget'] || row['Daily Budget'] || 0);
+    // Support both old format (Real-time Status) and new format (Avg. time in budget)
+    const status = (row['Real-time Status'] || row['Budget Status'] || row['Status'] || '').toLowerCase();
+    const avgTimeInBudget = num(row['Avg. time in budget'] || 0); // percentage 0-100
 
-    if (status.includes('out of budget') || status.includes('limited')) {
+    // New format: use min of missed sales range
+    const missedSalesMinRaw = row['Estimated missed sales min(EUR)'] || row['Estimated missed sales min'] || row['Estimated Missed Sales due to Budget'] || row['Estimated missed sales due to budget'] || '';
+    const missedSalesMaxRaw = row['Estimated missed sales max(EUR)'] || row['Estimated missed sales max'] || '';
+    // '-' means no estimate available; only compute when real numbers present
+    const missedSalesMin = (missedSalesMinRaw === '-' || missedSalesMinRaw === '') ? 0 : num(missedSalesMinRaw);
+    const missedSalesMax = (missedSalesMaxRaw === '-' || missedSalesMaxRaw === '') ? 0 : num(missedSalesMaxRaw);
+    const missedSales = missedSalesMin > 0 ? (missedSalesMin + missedSalesMax) / 2 : 0;
+    const missedClicks = num(row['Estimated missed clicks min'] || row['Estimated Missed Clicks due to Budget'] || 0);
+    const campaignName = row['Campaigns'] || row['Campaign Name'] || row['Campaign name'] || '';
+    const budget = num(row['Budget(EUR)'] || row['Campaign Daily Budget'] || row['Daily Budget'] || 0);
+
+    // Campaign is budget limited if:
+    // - Old format: status contains 'out of budget' / 'limited'
+    // - New format: Avg. time in budget = 0 (binary flag: 0=out of budget, 1=in budget)
+    //               OR Avg. time in budget is a % and < 80%
+    const timeInBudgetRaw = row['Avg. time in budget'];
+    const isNewBinaryFormat = timeInBudgetRaw === '0' || timeInBudgetRaw === '1' || timeInBudgetRaw === 0 || timeInBudgetRaw === 1;
+    const isLimited = status.includes('out of budget') || status.includes('limited') ||
+                      (isNewBinaryFormat && (timeInBudgetRaw === '0' || timeInBudgetRaw === 0)) ||
+                      (!isNewBinaryFormat && avgTimeInBudget > 0 && avgTimeInBudget < 80);
+
+    if (isLimited) {
       budgetLimited++;
       estimatedMissedSales += missedSales;
       estimatedMissedClicks += missedClicks;
-      limitedCampaigns.push({ campaignName, missedSales, dailyBudget });
+      limitedCampaigns.push({ campaignName, missedSales, budget });
     }
   }
 
@@ -255,32 +285,73 @@ function aggregateBusinessReport(rows) {
 
 function aggregateBrandAnalytics(rows) {
   const queries = [];
-  let totalBrandImpShare = 0, count = 0;
+  let totalImp = 0, brandImp = 0, totalClicks = 0, brandClicks = 0;
+  let totalPurch = 0, brandPurch = 0;
 
   for (const row of rows) {
     const query = (row['Search Query'] || row['Search Term'] || '').trim();
     const volume = num(row['Search Query Volume'] || 0);
-    const brandImpShare = num(row['Impressions - Brand Share'] || row['Brand Impression Share'] || 0);
-    const brandClickShare = num(row['Clicks - Brand Share'] || row['Brand Click Share'] || 0);
-    const brandPurchaseShare = num(row['Purchases - Brand Share'] || row['Brand Purchase Share'] || 0);
-    const totalPurchases = num(row['Purchases - Total Count'] || 0);
+    // Support both old and new SQP column naming conventions
+    const impTotal = num(row['Impressions: Total Count'] || row['Impressions - Total Count'] || 0);
+    const impBrand = num(row['Impressions: Brand Count'] || row['Impressions - Brand Count'] || 0);
+    const impBrandShare = num(row['Impressions: Brand Share %'] || row['Impressions - Brand Share'] || row['Brand Impression Share'] || 0);
+    const clickTotal = num(row['Clicks: Total Count'] || row['Clicks - Total Count'] || 0);
+    const clickBrand = num(row['Clicks: Brand Count'] || row['Clicks - Brand Count'] || 0);
+    const clickBrandShare = num(row['Clicks: Brand Share %'] || row['Clicks - Brand Share'] || row['Brand Click Share'] || 0);
+    const clickRate = num(row['Clicks: Click Rate %'] || row['Clicks - Click Rate %'] || 0);
+    const purchTotal = num(row['Purchases: Total Count'] || row['Purchases - Total Count'] || 0);
+    const purchBrand = num(row['Purchases: Brand Count'] || row['Purchases - Brand Count'] || 0);
+    const purchBrandShare = num(row['Purchases: Brand Share %'] || row['Purchases - Brand Share'] || row['Brand Purchase Share'] || 0);
+    const purchRate = num(row['Purchases: Purchase Rate %'] || row['Purchases - Purchase Rate %'] || 0);
+    const score = num(row['Search Query Score'] || 0);
 
     if (query) {
-      queries.push({ query, volume, brandImpShare, brandClickShare, brandPurchaseShare, totalPurchases });
-      totalBrandImpShare += brandImpShare;
-      count++;
+      queries.push({ query, volume, score, impTotal, impBrand, impBrandShare, clickTotal, clickBrand, clickBrandShare, clickRate, purchTotal, purchBrand, purchBrandShare, purchRate });
+      totalImp += impTotal; brandImp += impBrand;
+      totalClicks += clickTotal; brandClicks += clickBrand;
+      totalPurch += purchTotal; brandPurch += purchBrand;
     }
   }
 
+  const catCtr = totalImp > 0 ? (totalClicks / totalImp) * 100 : 0;
+  const catCr = totalClicks > 0 ? (totalPurch / totalClicks) * 100 : 0;
+  const brandCtr = brandImp > 0 ? (brandClicks / brandImp) * 100 : 0;
+  const brandCr = brandClicks > 0 ? (brandPurch / brandClicks) * 100 : 0;
+  const avgBrandImpShare = totalImp > 0 ? (brandImp / totalImp) * 100 : 0;
+  const avgBrandClickShare = totalClicks > 0 ? (brandClicks / totalClicks) * 100 : 0;
+  const avgBrandPurchShare = totalPurch > 0 ? (brandPurch / totalPurch) * 100 : 0;
+
+  const ctrGapPct = catCtr > 0 ? (brandCtr - catCtr) / catCtr * 100 : 0;
+  const crGapPct = catCr > 0 ? (brandCr - catCr) / catCr * 100 : 0;
+
+  // CR projection:
+  // - If brand CR is >20% below category: project to category average (show what closing the gap looks like)
+  // - Otherwise (brand at or above category): project to 50% above category average
+  let crProjection = null;
+  if (crGapPct < -20) {
+    const projPurch = brandClicks * (catCr / 100);
+    crProjection = { scenario: 'at_category_average', targetCr: catCr, projectedPurchases: projPurch, additionalPurchases: Math.max(0, projPurch - brandPurch) };
+  } else {
+    const targetCr = catCr * 1.5;
+    const projPurch = brandClicks * (targetCr / 100);
+    crProjection = { scenario: '50pct_above_average', targetCr, projectedPurchases: projPurch, additionalPurchases: Math.max(0, projPurch - brandPurch) };
+  }
+
   const lowShareOpportunities = queries
-    .filter(q => q.brandImpShare < 30 && q.volume > 50)
+    .filter(q => q.impBrandShare < 15 && q.volume > 500)
     .sort((a, b) => b.volume - a.volume)
     .slice(0, 10);
 
+  const brandedPositions = queries
+    .filter(q => q.impBrandShare > 40)
+    .sort((a, b) => b.volume - a.volume)
+    .slice(0, 8);
+
   return {
     totalQueries: queries.length,
-    avgBrandImpressionShare: count > 0 ? totalBrandImpShare / count : 0,
-    lowShareOpportunities,
+    avgBrandImpressionShare, avgBrandClickShare, avgBrandPurchShare,
+    catCtr, catCr, brandCtr, brandCr, ctrGapPct, crGapPct,
+    crProjection, lowShareOpportunities, brandedPositions,
     topQueryByVolume: queries.sort((a, b) => b.volume - a.volume).slice(0, 10)
   };
 }
@@ -321,24 +392,62 @@ function aggregateTargeting(rows) {
   return { matchBreakdown };
 }
 
+
+function aggregateSBSearchTerm(rows) {
+  let totalSpend = 0, totalSales = 0, totalOrders = 0, totalClicks = 0;
+  for (const row of rows) {
+    totalSpend += num(row['Spend']);
+    totalSales += num(row['14 Day Total Sales'] || row['14-Day Total Sales'] || 0);
+    totalOrders += num(row['14 Day Total Orders (#)'] || row['14-Day Total Orders (#)'] || 0);
+    totalClicks += num(row['Clicks']);
+  }
+  return { totalSpend, totalSales, totalOrders, totalClicks,
+    acos: totalSales > 0 ? (totalSpend / totalSales) * 100 : 0 };
+}
+
+function aggregateSDTargeting(rows) {
+  let totalSpend = 0, totalSales = 0, totalOrders = 0, totalClicks = 0;
+  for (const row of rows) {
+    totalSpend += num(row['Spend']);
+    totalSales += num(row['14 Day Total Sales'] || row['14-Day Total Sales'] || 0);
+    totalOrders += num(row['14 Day Total Orders (#)'] || row['14-Day Total Orders (#)'] || 0);
+    totalClicks += num(row['Clicks']);
+  }
+  return { totalSpend, totalSales, totalOrders, totalClicks,
+    acos: totalSales > 0 ? (totalSpend / totalSales) * 100 : 0 };
+}
+
 // ─── Benchmark Projections ───────────────────────────────────────────────────
 
 function calculateProjections(aggregated) {
   const projections = {};
 
-  // Ad mix projection (keep SP fixed, project SB and SD up to benchmarks)
+  // Ad mix projection — keep highest ad type fixed, project others to benchmarks
   if (aggregated.sp_search_term) {
     const spSales = aggregated.sp_search_term.totalSales;
+    const sbSales = aggregated.sb_search_term ? aggregated.sb_search_term.totalSales : 0;
+    const sdSales = aggregated.sd_targeting ? aggregated.sd_targeting.totalSales : 0;
+    const currentTotalAd = spSales + sbSales + sdSales;
+
+    // Keep SP fixed (it's largest), project others to benchmark ratios
     const projectedTotal = spSales / 0.65;
+    const projectedSb = projectedTotal * 0.275;
+    const projectedSd = projectedTotal * 0.075;
+
     projections.adMix = {
       currentSpSales: spSales,
+      currentSbSales: sbSales,
+      currentSdSales: sdSales,
+      currentTotalAdSales: currentTotalAd,
       benchmarkSp: 0.65,
       benchmarkSb: 0.275,
       benchmarkSd: 0.075,
-      projectedSbSales: projectedTotal * 0.275,
-      projectedSdSales: projectedTotal * 0.075,
+      projectedSbSales: projectedSb,
+      projectedSdSales: projectedSd,
       projectedTotalAdSales: projectedTotal,
-      additionalAdRevenue: projectedTotal - spSales
+      sbGap: Math.max(0, projectedSb - sbSales),
+      sdGap: Math.max(0, projectedSd - sdSales),
+      additionalAdRevenue: Math.max(0, projectedSb - sbSales) + Math.max(0, projectedSd - sdSales)
     };
   }
 
@@ -524,6 +633,8 @@ app.post('/analyse', upload.array('reports', 10), async (req, res) => {
     // Aggregate each report
     const aggregated = {};
     if (reports.sp_search_term) aggregated.sp_search_term = aggregateSPSearchTerm(reports.sp_search_term);
+    if (reports.sb_search_term) aggregated.sb_search_term = aggregateSBSearchTerm(reports.sb_search_term);
+    if (reports.sd_targeting) aggregated.sd_targeting = aggregateSDTargeting(reports.sd_targeting);
     if (reports.budget) aggregated.budget = aggregateBudget(reports.budget);
     if (reports.placement) aggregated.placement = aggregatePlacement(reports.placement);
     if (reports.business_report) aggregated.business_report = aggregateBusinessReport(reports.business_report);
