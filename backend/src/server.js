@@ -13,6 +13,7 @@ const axios = require('axios');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
+app.set('trust proxy', 1); // Trust Railway's proxy
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
 app.use(cors());
@@ -618,8 +619,7 @@ async function submitToHubSpot({ accountName, name, email, phone, auditScore, sh
           phone,
           company: accountName,
           hs_lead_source: 'Amazon Audit Tool',
-          amazon_audit_score: auditScore?.toString() || '',
-          audit_share_id: shareId || ''
+          amazon_audit_score: auditScore?.toString() || ''
         }
       },
       {
@@ -823,6 +823,7 @@ async function createDriveFolder(drive, name, parentId) {
       mimeType: 'application/vnd.google-apps.folder',
       parents: [parentId]
     },
+    supportsAllDrives: true,
     fields: 'id'
   });
   return res.data.id;
@@ -838,7 +839,8 @@ async function uploadFileToDrive(drive, folderId, filename, buffer, mimeType) {
     media: {
       mimeType: mimeType || 'application/octet-stream',
       body: stream
-    }
+    },
+    supportsAllDrives: true
   });
 }
 
@@ -942,10 +944,8 @@ async function upsertHubSpotContact({ email, company, shareId, isTeammate }) {
   const props = {
     email,
     company,
-    audit_share_id: shareId,
     hs_lead_source: 'Amazon Audit Tool'
   };
-  if (isTeammate) props.audit_shared_to_teammate = true;
 
   try {
     await axios.post(
