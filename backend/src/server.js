@@ -1,6 +1,8 @@
 const express = require('express');
 const { google } = require('googleapis');
 const { Readable } = require('stream');
+const { Pool } = require('pg');
+const crypto = require('crypto');
 const multer = require('multer');
 const cors = require('cors');
 const { parse } = require('csv-parse/sync');
@@ -18,6 +20,25 @@ const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20 });
 app.use('/analyse', limiter);
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+
+// ─── Database ────────────────────────────────────────────────────────────────
+
+const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+
+async function initDb() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS audits (
+      id TEXT PRIMARY KEY,
+      account_name TEXT,
+      contact_name TEXT,
+      contact_email TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      audit_data JSONB
+    )
+  `);
+}
+initDb().catch(e => console.error('DB init error:', e.message));
 
 // ─── CSV Parsing ────────────────────────────────────────────────────────────
 
@@ -531,14 +552,21 @@ Important: Reference specific numbers from this data. Do not be generic. Output 
       }
     }
 
+    // Generate share ID and save to DB
+    const shareId = crypto.randomBytes(8).toString('hex');
+    db.query(
+      'INSERT INTO audits (id, account_name, contact_name, contact_email, audit_data) VALUES ($1, $2, $3, $4, $5)',
+      [shareId, accountName, name, email, JSON.stringify(auditData)]
+    ).catch(e => console.error('DB save error:', e.message));
+
     // Fire HubSpot and Drive in background
-    submitToHubSpot({ accountName, name, email, phone, auditScore: auditData.accountScore })
+    submitToHubSpot({ accountName, name, email, phone, auditScore: auditData.accountScore, shareId })
       .catch(err => console.error('HubSpot error:', err.message));
 
     saveToDrive({ accountName, name, email, files: req.files, auditData })
       .catch(err => console.error('Drive error:', err.message));
 
-    res.json({ success: true, audit: auditData, accountName });
+    res.json({ success: true, audit: auditData, accountName, shareId });
 
   } catch (error) {
     console.error('Analyse error:', error);
@@ -548,7 +576,7 @@ Important: Reference specific numbers from this data. Do not be generic. Output 
 
 // ─── HubSpot ─────────────────────────────────────────────────────────────────
 
-async function submitToHubSpot({ accountName, name, email, phone, auditScore }) {
+async function submitToHubSpot({ accountName, name, email, phone, auditScore, shareId }) {
   if (!process.env.HUBSPOT_ACCESS_TOKEN) return;
 
   const nameParts = name.trim().split(' ');
@@ -567,7 +595,8 @@ async function submitToHubSpot({ accountName, name, email, phone, auditScore }) 
           phone,
           company: accountName,
           hs_lead_source: 'Amazon Audit Tool',
-          amazon_audit_score: auditScore?.toString() || ''
+          amazon_audit_score: auditScore?.toString() || '',
+          audit_share_id: shareId || ''
         }
       },
       {
@@ -672,6 +701,82 @@ async function saveToDrive({ accountName, name, email, files, auditData }) {
     console.log(`Drive: saved ${files.length} files + summary to "${folderName}"`);
   } catch (e) {
     console.error('Drive upload error:', e.message);
+  }
+}
+
+
+// ─── Results retrieval ───────────────────────────────────────────────────────
+
+app.get('/results/:id', async (req, res) => {
+  try {
+    const { rows } = await db.query('SELECT * FROM audits WHERE id = $1', [req.params.id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Audit not found.' });
+    const row = rows[0];
+    res.json({
+      success: true,
+      audit: row.audit_data,
+      accountName: row.account_name,
+      shareId: row.id
+    });
+  } catch (e) {
+    console.error('Results fetch error:', e.message);
+    res.status(500).json({ error: 'Failed to retrieve audit.' });
+  }
+});
+
+// ─── Share with teammate ─────────────────────────────────────────────────────
+
+app.post('/share', express.json(), async (req, res) => {
+  try {
+    const { shareId, teammateEmail, accountName } = req.body;
+    if (!shareId || !teammateEmail) return res.status(400).json({ error: 'shareId and teammateEmail are required.' });
+
+    // Fetch audit from DB to get original contact info
+    const { rows } = await db.query('SELECT * FROM audits WHERE id = $1', [shareId]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Audit not found.' });
+
+    // Create or update teammate contact in HubSpot
+    await upsertHubSpotContact({
+      email: teammateEmail,
+      company: accountName,
+      shareId,
+      isTeammate: true
+    });
+
+    res.json({ success: true });
+  } catch (e) {
+    console.error('Share error:', e.message);
+    res.status(500).json({ error: 'Failed to share audit.' });
+  }
+});
+
+async function upsertHubSpotContact({ email, company, shareId, isTeammate }) {
+  if (!process.env.HUBSPOT_ACCESS_TOKEN) return;
+  const props = {
+    email,
+    company,
+    audit_share_id: shareId,
+    hs_lead_source: 'Amazon Audit Tool'
+  };
+  if (isTeammate) props.audit_shared_to_teammate = true;
+
+  try {
+    await axios.post(
+      'https://api.hubapi.com/crm/v3/objects/contacts',
+      { properties: props },
+      { headers: { Authorization: `Bearer ${process.env.HUBSPOT_ACCESS_TOKEN}`, 'Content-Type': 'application/json' } }
+    );
+  } catch (err) {
+    if (err.response?.status === 409) {
+      const existing = err.response.data?.message?.match(/ID: (\d+)/)?.[1];
+      if (existing) {
+        await axios.patch(
+          `https://api.hubapi.com/crm/v3/objects/contacts/${existing}`,
+          { properties: { audit_share_id: shareId, audit_shared_to_teammate: isTeammate || false } },
+          { headers: { Authorization: `Bearer ${process.env.HUBSPOT_ACCESS_TOKEN}`, 'Content-Type': 'application/json' } }
+        );
+      }
+    } else throw err;
   }
 }
 
