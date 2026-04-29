@@ -3,6 +3,7 @@ const { google } = require('googleapis');
 const { Readable } = require('stream');
 const { Pool } = require('pg');
 const crypto = require('crypto');
+const { Resend } = require('resend');
 const multer = require('multer');
 const cors = require('cors');
 const { parse } = require('csv-parse/sync');
@@ -21,6 +22,8 @@ app.use('/analyse', limiter);
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 // ─── Database ────────────────────────────────────────────────────────────────
 
@@ -566,6 +569,9 @@ Important: Reference specific numbers from this data. Do not be generic. Output 
     saveToDrive({ accountName, name, email, files: req.files, auditData })
       .catch(err => console.error('Drive error:', err.message));
 
+    sendAuditEmail({ contactName: name, contactEmail: email, accountName, auditData, shareId })
+      .catch(err => console.error('Email error:', err.message));
+
     res.json({ success: true, audit: auditData, accountName, shareId });
 
   } catch (error) {
@@ -621,6 +627,160 @@ async function submitToHubSpot({ accountName, name, email, phone, auditScore, sh
   }
 }
 
+
+
+// ─── Email via Resend ─────────────────────────────────────────────────────────
+
+function formatCurrency(amount, currency = '£') {
+  if (!amount) return `${currency}0`;
+  return `${currency}${Math.round(amount).toLocaleString('en-GB')}`;
+}
+
+function buildAuditEmail({ contactName, accountName, auditData, shareId, currency = '£' }) {
+  const shareUrl = `https://audit.sellersside.com/results/${shareId}`;
+  const opportunity = formatCurrency(auditData.totalProjectedOpportunity, currency);
+  const score = auditData.accountScore || 0;
+  const findings = (auditData.keyFindings || []).slice(0, 4);
+  const priorities = (auditData.strategicPriorities || []).slice(0, 5);
+
+  const findingsRows = findings.map(f => `
+    <tr>
+      <td style="padding:14px 0;border-bottom:1px solid #f0f0f0;vertical-align:top;">
+        <div style="font-family:Georgia,serif;font-size:15px;color:#14181f;margin-bottom:4px;">${f.title}</div>
+        <div style="font-family:Arial,sans-serif;font-size:12px;color:#6a7181;line-height:1.6;">${f.finding}</div>
+      </td>
+      <td style="padding:14px 0;border-bottom:1px solid #f0f0f0;vertical-align:top;text-align:right;white-space:nowrap;width:120px;">
+        ${f.projectedValue ? `<div style="font-family:Georgia,serif;font-size:18px;color:#FF5D3D;">${f.projectedValue}</div>` : ''}
+        <div style="font-family:Arial,sans-serif;font-size:10px;color:#6a7181;margin-top:2px;text-transform:uppercase;letter-spacing:0.05em;">${f.impact} impact</div>
+      </td>
+    </tr>`).join('');
+
+  const priorityRows = priorities.map(p => `
+    <tr>
+      <td style="padding:12px 0;border-bottom:1px solid #f0f0f0;vertical-align:top;width:36px;">
+        <div style="width:24px;height:24px;background:#FF5D3D;border-radius:50%;text-align:center;line-height:24px;font-family:Arial,sans-serif;font-size:12px;font-weight:700;color:#fff;">${p.priority}</div>
+      </td>
+      <td style="padding:12px 0 12px 12px;border-bottom:1px solid #f0f0f0;vertical-align:top;">
+        <div style="font-family:Georgia,serif;font-size:15px;color:#14181f;margin-bottom:3px;">${p.action}</div>
+        <div style="font-family:Arial,sans-serif;font-size:11px;color:#6a7181;">${p.timeframe} &middot; ${p.impact} impact</div>
+      </td>
+    </tr>`).join('');
+
+  return `<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
+<body style="margin:0;padding:0;background:#f4f4f4;font-family:Georgia,'Times New Roman',serif;">
+<table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:40px 20px;">
+<table width="620" cellpadding="0" cellspacing="0" style="background:#ffffff;max-width:620px;">
+
+  <!-- HEADER -->
+  <tr><td style="background:#14181f;padding:32px 40px;">
+    <div style="font-family:Georgia,serif;font-size:22px;color:#ffffff;">Sellers<span style="color:#FF5D3D;">Side</span></div>
+    <div style="font-family:Arial,sans-serif;font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:rgba(255,255,255,0.4);margin-top:4px;">Amazon Account Audit Report</div>
+  </td></tr>
+
+  <!-- HERO -->
+  <tr><td style="padding:40px 40px 32px;border-bottom:1px solid #e8e8e8;">
+    <div style="font-family:Arial,sans-serif;font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#FF5D3D;margin-bottom:12px;">Your Audit Is Ready</div>
+    <div style="font-family:Georgia,serif;font-size:26px;line-height:1.35;color:#14181f;margin-bottom:12px;">Hi ${contactName} &mdash; here's what we found in <em style="color:#FF5D3D;">${accountName}'s</em> account.</div>
+    <div style="font-family:Arial,sans-serif;font-size:13px;color:#6a7181;line-height:1.6;">We've analysed your advertising data against industry benchmarks. Below is a summary of the key findings and revenue opportunities identified.</div>
+  </td></tr>
+
+  <!-- OPPORTUNITY BAND -->
+  <tr><td style="background:#14181f;padding:28px 40px;">
+    <table width="100%" cellpadding="0" cellspacing="0"><tr>
+      <td style="vertical-align:middle;">
+        <div style="font-family:Arial,sans-serif;font-size:10px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:rgba(255,255,255,0.4);margin-bottom:4px;">Total Identified Opportunity</div>
+        <div style="font-family:Georgia,serif;font-size:44px;color:#ffffff;line-height:1;">${opportunity}/mo</div>
+        <div style="font-family:Arial,sans-serif;font-size:11px;color:rgba(255,255,255,0.4);margin-top:4px;">across ${findings.length} growth vectors identified</div>
+      </td>
+      <td style="vertical-align:middle;text-align:right;width:140px;">
+        <div style="font-family:Arial,sans-serif;font-size:10px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:rgba(255,255,255,0.4);margin-bottom:6px;">Account Score</div>
+        <div style="font-family:Georgia,serif;font-size:52px;color:#FF5D3D;line-height:1;">${score}</div>
+        <div style="font-family:Arial,sans-serif;font-size:11px;color:rgba(255,255,255,0.4);">out of 100</div>
+      </td>
+    </tr></table>
+  </td></tr>
+
+  <!-- KEY FINDINGS -->
+  <tr><td style="padding:32px 40px;border-bottom:1px solid #e8e8e8;">
+    <div style="font-family:Arial,sans-serif;font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#6a7181;margin-bottom:16px;">&rarr; Key Findings</div>
+    <table width="100%" cellpadding="0" cellspacing="0">${findingsRows}</table>
+  </td></tr>
+
+  <!-- STRATEGIC PRIORITIES -->
+  <tr><td style="padding:32px 40px;border-bottom:1px solid #e8e8e8;">
+    <div style="font-family:Arial,sans-serif;font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#6a7181;margin-bottom:16px;">&rarr; Strategic Priorities</div>
+    <table width="100%" cellpadding="0" cellspacing="0">${priorityRows}</table>
+  </td></tr>
+
+  <!-- VIEW FULL AUDIT -->
+  <tr><td style="padding:24px 40px;border-bottom:1px solid #e8e8e8;background:#f7f7f7;">
+    <table width="100%" cellpadding="0" cellspacing="0"><tr>
+      <td style="vertical-align:middle;">
+        <div style="font-family:Georgia,serif;font-size:15px;color:#14181f;margin-bottom:3px;">View your full interactive audit</div>
+        <div style="font-family:Arial,sans-serif;font-size:12px;color:#6a7181;">Includes all charts, benchmarks, and detailed analysis.</div>
+      </td>
+      <td style="vertical-align:middle;text-align:right;width:160px;">
+        <a href="${shareUrl}" style="display:inline-block;background:#14181f;color:#ffffff;font-family:Arial,sans-serif;font-size:12px;font-weight:700;text-decoration:none;padding:10px 20px;border-radius:100px;">View Audit &rarr;</a>
+      </td>
+    </tr></table>
+  </td></tr>
+
+  <!-- CTA -->
+  <tr><td style="padding:40px;text-align:center;border-top:3px solid #FF5D3D;">
+    <div style="font-family:Georgia,serif;font-size:22px;line-height:1.45;color:#14181f;margin-bottom:8px;max-width:460px;margin-left:auto;margin-right:auto;">${accountName} has <strong style="color:#FF5D3D;">${opportunity}/month</strong> in identified revenue sitting uncaptured.</div>
+    <div style="font-family:Arial,sans-serif;font-size:12px;color:#6a7181;margin-bottom:24px;">A 30-minute strategy call will produce a specific execution plan against every one of these findings.</div>
+    <a href="https://calendly.com/d/cwhr-sxg-4nb/profit-audit-analysis" style="display:inline-block;background:#FF5D3D;color:#ffffff;font-family:Arial,sans-serif;font-size:13px;font-weight:700;text-decoration:none;padding:14px 32px;border-radius:100px;letter-spacing:0.02em;">Book Your Free Strategy Call &rarr;</a>
+    <div style="font-family:Arial,sans-serif;font-size:11px;color:#6a7181;margin-top:14px;">No obligation &middot; 30 minutes &middot; Amazon specialists only</div>
+  </td></tr>
+
+  <!-- FOOTER -->
+  <tr><td style="background:#f7f7f7;padding:24px 40px;text-align:center;border-top:1px solid #e8e8e8;">
+    <div style="font-family:Arial,sans-serif;font-size:11px;color:#6a7181;line-height:1.7;">
+      Sellers Side &middot; London, UK<br>
+      This audit was generated at <a href="https://audit.sellersside.com" style="color:#FF5D3D;text-decoration:none;">audit.sellersside.com</a><br>
+      <a href="%unsubscribe_url%" style="color:#FF5D3D;text-decoration:none;">Unsubscribe</a>
+    </div>
+  </td></tr>
+
+</table>
+</td></tr></table>
+</body>
+</html>`;
+}
+
+async function sendAuditEmail({ contactName, contactEmail, accountName, auditData, shareId }) {
+  if (!process.env.RESEND_API_KEY) return;
+  const currency = auditData.currency || '£';
+  try {
+    await resend.emails.send({
+      from: 'Sellers Side <jonny@sellersside.com>',
+      to: contactEmail,
+      subject: `Your Amazon account audit is ready, ${contactName}`,
+      html: buildAuditEmail({ contactName, accountName, auditData, shareId, currency })
+    });
+    console.log(`Email sent to ${contactEmail}`);
+  } catch (e) {
+    console.error('Resend error:', e.message);
+  }
+}
+
+async function sendTeammateEmail({ teammateEmail, contactName, accountName, auditData, shareId }) {
+  if (!process.env.RESEND_API_KEY) return;
+  const currency = auditData.currency || '£';
+  try {
+    await resend.emails.send({
+      from: 'Sellers Side <jonny@sellersside.com>',
+      to: teammateEmail,
+      subject: `${contactName} shared an Amazon audit for ${accountName}`,
+      html: buildAuditEmail({ contactName: `a teammate`, accountName, auditData, shareId, currency })
+    });
+    console.log(`Teammate email sent to ${teammateEmail}`);
+  } catch (e) {
+    console.error('Resend teammate email error:', e.message);
+  }
+}
 
 // ─── Google Drive ─────────────────────────────────────────────────────────────
 
@@ -742,6 +902,16 @@ app.post('/share', express.json(), async (req, res) => {
       shareId,
       isTeammate: true
     });
+
+    // Fetch audit data to send in email
+    const auditRow = rows[0];
+    sendTeammateEmail({
+      teammateEmail,
+      contactName: auditRow.contact_name,
+      accountName,
+      auditData: auditRow.audit_data,
+      shareId
+    }).catch(e => console.error('Teammate email error:', e.message));
 
     res.json({ success: true });
   } catch (e) {
