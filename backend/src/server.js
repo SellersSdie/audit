@@ -4,6 +4,7 @@ const { Readable } = require('stream');
 const { Pool } = require('pg');
 const crypto = require('crypto');
 const { Resend } = require('resend');
+const XLSX = require('xlsx');
 const multer = require('multer');
 const cors = require('cors');
 const { parse } = require('csv-parse/sync');
@@ -45,7 +46,23 @@ initDb().catch(e => console.error('DB init error:', e.message));
 
 // ─── CSV Parsing ────────────────────────────────────────────────────────────
 
-function parseCSV(buffer) {
+function parseCSV(buffer, originalname) {
+  const ext = (originalname || '').split('.').pop().toLowerCase();
+
+  // XLSX / XLS handling
+  if (ext === 'xlsx' || ext === 'xls') {
+    try {
+      const workbook = XLSX.read(buffer, { type: 'buffer', cellDates: true });
+      const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+      return rows;
+    } catch (e) {
+      console.error('XLSX parse error:', e.message);
+      return [];
+    }
+  }
+
+  // CSV handling
   let text = buffer.toString('utf8').replace(/^\uFEFF/, ''); // strip BOM
   try {
     const rows = parse(text, { columns: true, skip_empty_lines: true, trim: true, relax_quotes: true });
@@ -495,7 +512,7 @@ app.post('/analyse', upload.array('reports', 10), async (req, res) => {
     const uploadedTypes = [];
 
     for (const file of req.files) {
-      const rows = normaliseHeaders(parseCSV(file.buffer));
+      const rows = normaliseHeaders(parseCSV(file.buffer, file.originalname));
       if (rows.length === 0) continue;
       const headers = Object.keys(rows[0]);
       const type = detectReportType(headers);
